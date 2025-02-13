@@ -1,0 +1,13 @@
+tensorflow
+tensorflow.keras
+torch
+torchvision
+pillow
+numpy
+matplotlib
+scipy
+pandas
+scikit-learn
+opencv-python
+tqdm
+requests
