@@ -1,265 +1,163 @@
-# train_yolov5.py
-
 import os
-import sys
-import numpy as np
-import pandas as pd
-from PIL import Image
-from tqdm import tqdm
+import cv2
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+import scipy.io
+import numpy as np
+from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import transforms
+from sklearn.model_selection import train_test_split
 
-# Add the YOLOv5 directory to sys.path
-YOLOv5_PATH = os.path.join(os.path.dirname(__file__), 'yolov5')
-if YOLOv5_PATH not in sys.path:
-    sys.path.insert(0, YOLOv5_PATH)
-
-from models.yolo import DetectionModel
-from utils.torch_utils import select_device
-
-# Custom classification model
-class ClassificationModel(DetectionModel):
-    def __init__(self, cfg, ch=3, nc=1000):
-        super().__init__(cfg, ch=ch, nc=nc)
-
-        # Remove the Detect() layer
-        self.model = self.model[:-1]
-
-        # Add classification head
-        last_layer = self.model[-1]
-        if hasattr(last_layer, 'cv2'):
-            last_layer_out_channels = last_layer.cv2.out_channels
-        elif hasattr(last_layer, 'cv1'):
-            last_layer_out_channels = last_layer.cv1.out_channels
-        elif hasattr(last_layer, 'conv'):
-            last_layer_out_channels = last_layer.conv.out_channels
-        else:
-            # Use a dummy input to determine the output channels
-            dummy_input = torch.zeros(1, ch, 224, 224)
-            with torch.no_grad():
-                x = dummy_input
-                for m in self.model:
-                    x = m(x)
-                last_layer_out_channels = x.shape[1]
-
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(last_layer_out_channels, nc)
-        )
-
-    def forward(self, x):
-        y = []  # outputs
-
-        for m in self.model:
-            if m.f != -1:  # if not first layer, get input from previous layers
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
-            x = m(x)
-            y.append(x)
-
-        x = self.fc(x)
-        return x
-
-# Dataset class
-class FlowerDataset(Dataset):
-    def __init__(self, dataframe, image_dir, transforms=None):
-        self.data = dataframe.reset_index(drop=True)
-        self.image_dir = image_dir
-        self.transforms = transforms
-        self.labels = self.data['label'].astype(int).values  # Labels already adjusted
+# -----------------------------
+# Custom Dataset for Flowers
+# -----------------------------
+class FlowersDataset(Dataset):
+    def __init__(self, images_dir, labels, transform=None):
+        """
+        Args:
+            images_dir (str): Path to directory containing flower images.
+            labels (np.ndarray): 1D array of labels (1-indexed).
+            transform (callable, optional): Optional transform to be applied on an image.
+        """
+        self.images_dir = images_dir
+        self.labels = labels
+        self.transform = transform
+        self.image_files = sorted(os.listdir(images_dir))  # Ensure consistent order
 
     def __len__(self):
-        return len(self.data)
+        return len(self.image_files)
 
     def __getitem__(self, idx):
-        img_name = os.path.join(self.image_dir, self.data.iloc[idx]['filename'])
-        image = Image.open(img_name).convert('RGB')
-
-        if self.transforms:
-            image = self.transforms(image)
-
-        label = self.labels[idx]
+        img_path = os.path.join(self.images_dir, self.image_files[idx])
+        image = cv2.imread(img_path)
+        if image is None:
+            raise ValueError(f"Failed to load image: {img_path}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if self.transform:
+            image = self.transform(image)
+        # Convert 1-indexed label to 0-indexed
+        label = int(self.labels[idx]) - 1
         return image, label
 
-# Function to create the classification model
-def create_yolov5_classification_model(num_classes):
-    # Paths to YOLOv5 configuration and weights
-    cfg = os.path.join(YOLOv5_PATH, 'models', 'yolov5s.yaml')  # Use the detection model configuration
-    weights = os.path.join(YOLOv5_PATH, 'yolov5s.pt')
+# -----------------------------
+# Load Pretrained YOLOv5 and Prepare Backbone
+# -----------------------------
+# Download and load YOLOv5s (requires internet on first run)
+yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
 
-    # Initialize the custom classification model
-    model = ClassificationModel(cfg, ch=3, nc=num_classes)
+# Freeze all YOLOv5 parameters
+for param in yolo_model.parameters():
+    param.requires_grad = False
 
-    # Load pre-trained weights
-    ckpt = torch.load(weights, map_location='cpu')
-    state_dict = ckpt['model'].float().state_dict()
-    # Exclude the Detect layer's weights
-    filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('model.24')}
-    model.load_state_dict(filtered_state_dict, strict=False)
+# YOLOv5 model (from torch.hub) has a .model attribute that is an nn.Sequential of layers.
+# We remove the detection head (usually the last module) and use the remainder as a backbone.
+# (This architecture may change over time so adjust slicing as needed.)
+backbone = nn.Sequential(*list(yolo_model.model.children())[:-1])
 
-    return model
+# Pass a dummy image to determine the backbone’s output channel dimension.
+dummy_input = torch.randn(1, 3, 640, 640)
+with torch.no_grad():
+    features = backbone(dummy_input)
+# features shape is (batch, channels, H, W)
+C = features.shape[1]
 
-# Training and evaluation function
-def run_yolov5(train_data, val_data, test_data, image_dir, output_dir, num_classes=102, batch_size=32, epochs=10):
-    # Image size
-    img_size = 224
+# Define a classification head: global pooling + flatten + linear layer for 102 classes.
+classifier_head = nn.Sequential(
+    nn.AdaptiveAvgPool2d((1, 1)),
+    nn.Flatten(),
+    nn.Linear(C, 102)  # Oxford Flowers 102 classes
+)
 
-    # Transforms
-    data_transforms = {
-        'train': transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(30),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                 [0.229, 0.224, 0.225])
-        ]),
-        'val': transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.CenterCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.485, 0.456, 0.406],
-                                 [0.229, 0.224, 0.225])
-        ]),
-    }
+# Combine backbone and classifier head into one model.
+class YOLOv5Classifier(nn.Module):
+    def __init__(self, backbone, classifier):
+        super(YOLOv5Classifier, self).__init__()
+        self.backbone = backbone
+        self.classifier = classifier
 
-    # Datasets
-    train_dataset = FlowerDataset(train_data, image_dir, transforms=data_transforms['train'])
-    val_dataset = FlowerDataset(val_data, image_dir, transforms=data_transforms['val'])
-    test_dataset = FlowerDataset(test_data, image_dir, transforms=data_transforms['val'])
+    def forward(self, x):
+        x = self.backbone(x)
+        x = self.classifier(x)
+        return x
 
-    # Data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+model = YOLOv5Classifier(backbone, classifier_head)
 
-    # Device
-    device = select_device('')  # Use GPU if available
+# -----------------------------
+# Training Setup
+# -----------------------------
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
 
-    # Model
-    model = create_yolov5_classification_model(num_classes)
-    model = model.to(device)
+criterion = nn.CrossEntropyLoss()
+# We train only the classifier head parameters.
+optimizer = optim.Adam(model.classifier.parameters(), lr=1e-3)
 
-    # Freeze the pre-trained layers (optional)
-    for param in model.model.parameters():
-        param.requires_grad = False
-    # Ensure classification head is trainable
-    for param in model.fc.parameters():
-        param.requires_grad = True
+# -----------------------------
+# Data Preparation
+# -----------------------------
+# Define image transformations.
+data_transforms = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize((640, 640)),  # YOLOv5 default input size
+    transforms.ToTensor(),
+    # (Optional) Normalize using ImageNet stats if desired:
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
 
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
+# Load labels from imagelabels.mat.
+# The .mat file usually contains a variable named 'labels'
+mat = scipy.io.loadmat('imagelabels.mat')
+labels = mat['labels'][0]  # Adjust key if necessary
 
-    # Training loop
-    best_val_acc = 0.0
-    for epoch in range(epochs):
+# Create full dataset.
+dataset = FlowersDataset('102flowers/jpg', labels, transform=data_transforms)
+
+# Split indices for training and validation (80/20 split)
+all_indices = np.arange(len(dataset))
+train_indices, val_indices = train_test_split(all_indices, test_size=0.2, random_state=42)
+
+train_dataset = Subset(dataset, train_indices)
+val_dataset = Subset(dataset, val_indices)
+
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
+
+# -----------------------------
+# Training Loop
+# -----------------------------
+if __name__ == '__main__':
+    num_epochs = 100
+    for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        correct = 0
-        total = 0
-
-        for images, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} - Training"):
-            images, labels = images.to(device), labels.to(device)
+        for images, targets in train_loader:
+            images = images.to(device)
+            targets = targets.to(device)
 
             optimizer.zero_grad()
-            outputs = model(images)  # Forward pass
-
-            loss = criterion(outputs, labels)
+            outputs = model(images)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item() * images.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+        epoch_loss = running_loss / len(train_dataset)
+        print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {epoch_loss:.4f}")
 
-        epoch_loss = running_loss / total
-        epoch_acc = correct / total * 100
-        print(f"Training Loss: {epoch_loss:.4f}, Training Accuracy: {epoch_acc:.2f}%")
-
-        # Validation
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
+        correct = 0
+        total = 0
         with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} - Validation"):
-                images, labels = images.to(device), labels.to(device)
+            for images, targets in val_loader:
+                images = images.to(device)
+                targets = targets.to(device)
                 outputs = model(images)
+                _, preds = torch.max(outputs, 1)
+                total += targets.size(0)
+                correct += (preds == targets).sum().item()
+        val_accuracy = correct / total
+        print(f"Epoch {epoch+1}/{num_epochs} - Validation Accuracy: {val_accuracy:.4f}")
 
-                loss = criterion(outputs, labels)
-                val_loss += loss.item() * images.size(0)
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-
-        val_epoch_loss = val_loss / val_total
-        val_epoch_acc = val_correct / val_total * 100
-        print(f"Validation Loss: {val_epoch_loss:.4f}, Validation Accuracy: {val_epoch_acc:.2f}%")
-
-        # Save best model
-        if val_epoch_acc > best_val_acc:
-            best_val_acc = val_epoch_acc
-            torch.save(model.state_dict(), os.path.join(output_dir, 'best_yolov5_model.pth'))
-
-    print("Training completed. Best Validation Accuracy: {:.2f}%".format(best_val_acc))
-
-    # Load best model
-    model.load_state_dict(torch.load(os.path.join(output_dir, 'best_yolov5_model.pth')))
-
-    # Testing
-    model.eval()
-    probabilities = []
-    predictions = []
-    filenames = test_data['filename'].tolist()
-
-    with torch.no_grad():
-        for images, _ in tqdm(test_loader, desc="Testing"):
-            images = images.to(device)
-            outputs = model(images)
-            probs = nn.functional.softmax(outputs, dim=1)
-            probabilities.append(probs.cpu().numpy()[0])
-            _, predicted = torch.max(outputs.data, 1)
-            predictions.append(predicted.cpu().numpy()[0] + 1)  # Adjust back to original labels
-
-    test_probabilities = pd.DataFrame({
-        'filename': filenames,
-        'probabilities': probabilities,
-        'predicted_class': predictions
-    })
-
-    # Save predictions
-    test_probabilities.to_csv(os.path.join(output_dir, 'yolov5_test_predictions.csv'), index=False)
-    print("YOLOv5 training and prediction completed. Outputs saved to:", output_dir)
-
-def main():
-    # Paths
-    split_dir = 'data_splits'
-    image_dir = '102flowers/jpg'  # Adjust if necessary
-    output_dir = 'yolov5_output'
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Load data splits
-    train_data = pd.read_csv(os.path.join(split_dir, 'train_data.csv'))
-    val_data = pd.read_csv(os.path.join(split_dir, 'val_data.csv'))
-    test_data = pd.read_csv(os.path.join(split_dir, 'test_data.csv'))
-
-    # Ensure labels are integers
-    for df in [train_data, val_data, test_data]:
-        df['label'] = df['label'].astype(int) - 1  # Adjust labels to start from 0
-
-    # Number of classes
-    num_classes = len(train_data['label'].unique())
-
-    # Run YOLOv5 classification
-    run_yolov5(train_data, val_data, test_data, image_dir, output_dir, num_classes=num_classes, epochs=10)
-
-if __name__ == '__main__':
-    main()
+    print("Training complete.")

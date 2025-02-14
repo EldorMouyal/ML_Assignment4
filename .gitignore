@@ -5,3 +5,4 @@ __pycache__/
 /flower_dataset/
 /data_splits/
 /venv_py10/
+.idea/
