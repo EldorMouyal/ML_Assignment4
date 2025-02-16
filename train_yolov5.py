@@ -1,163 +1,146 @@
 import os
-import cv2
+import shutil
+import yaml
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import scipy.io
-import numpy as np
-from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision import transforms
 from sklearn.model_selection import train_test_split
+from yolov5 import train  # Ensure the YOLOv5 repository is in your PYTHONPATH
+
 
 # -----------------------------
-# Custom Dataset for Flowers
+# Step 1: Generate YOLO-format Annotations
 # -----------------------------
-class FlowersDataset(Dataset):
-    def __init__(self, images_dir, labels, transform=None):
-        """
-        Args:
-            images_dir (str): Path to directory containing flower images.
-            labels (np.ndarray): 1D array of labels (1-indexed).
-            transform (callable, optional): Optional transform to be applied on an image.
-        """
-        self.images_dir = images_dir
-        self.labels = labels
-        self.transform = transform
-        self.image_files = sorted(os.listdir(images_dir))  # Ensure consistent order
+def generate_yolo_annotations(images_dir, annotations_dir, labels):
+    """
+    For each image, create a YOLO-format annotation file.
+    Assumes each image contains one object (the flower) that fills the image.
+    Annotation: <class> 0.5 0.5 1 1
+    """
+    os.makedirs(annotations_dir, exist_ok=True)
+    image_files = sorted(os.listdir(images_dir))
+    if len(image_files) != len(labels):
+        raise ValueError("Number of images and labels do not match!")
+    for idx, img_file in enumerate(image_files):
+        label = int(labels[idx]) - 1  # convert to 0-indexed
+        annotation_line = f"{label} 0.5 0.5 1 1\n"
+        base_name = os.path.splitext(img_file)[0]
+        out_path = os.path.join(annotations_dir, base_name + ".txt")
+        with open(out_path, "w") as f:
+            f.write(annotation_line)
+    print(f"Annotations created in {annotations_dir}")
 
-    def __len__(self):
-        return len(self.image_files)
-
-    def __getitem__(self, idx):
-        img_path = os.path.join(self.images_dir, self.image_files[idx])
-        image = cv2.imread(img_path)
-        if image is None:
-            raise ValueError(f"Failed to load image: {img_path}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        if self.transform:
-            image = self.transform(image)
-        # Convert 1-indexed label to 0-indexed
-        label = int(self.labels[idx]) - 1
-        return image, label
 
 # -----------------------------
-# Load Pretrained YOLOv5 and Prepare Backbone
+# Step 2: Organize Dataset into YOLOv5 Structure
 # -----------------------------
-# Download and load YOLOv5s (requires internet on first run)
-yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+def organize_dataset(source_images_dir, source_labels_dir, base_dir, test_size=0.25, random_state=42):
+    """
+    Split images into train/val/test and copy images and corresponding annotation files
+    into the YOLOv5 expected folder structure under base_dir.
+    """
+    image_files = sorted(os.listdir(source_images_dir))
 
-# Freeze all YOLOv5 parameters
-for param in yolo_model.parameters():
-    param.requires_grad = False
+    # Split file names
+    train_val, test = train_test_split(image_files, test_size=test_size, random_state=random_state)
+    train, val = train_test_split(train_val, test_size=1 / 3, random_state=random_state)
 
-# YOLOv5 model (from torch.hub) has a .model attribute that is an nn.Sequential of layers.
-# We remove the detection head (usually the last module) and use the remainder as a backbone.
-# (This architecture may change over time so adjust slicing as needed.)
-backbone = nn.Sequential(*list(yolo_model.model.children())[:-1])
+    # Define destination directories
+    images_train_dir = os.path.join(base_dir, "images", "train")
+    images_val_dir = os.path.join(base_dir, "images", "val")
+    images_test_dir = os.path.join(base_dir, "images", "test")
+    labels_train_dir = os.path.join(base_dir, "labels", "train")
+    labels_val_dir = os.path.join(base_dir, "labels", "val")
+    labels_test_dir = os.path.join(base_dir, "labels", "test")
 
-# Pass a dummy image to determine the backbone’s output channel dimension.
-dummy_input = torch.randn(1, 3, 640, 640)
-with torch.no_grad():
-    features = backbone(dummy_input)
-# features shape is (batch, channels, H, W)
-C = features.shape[1]
+    for d in [images_train_dir, images_val_dir, images_test_dir,
+              labels_train_dir, labels_val_dir, labels_test_dir]:
+        os.makedirs(d, exist_ok=True)
 
-# Define a classification head: global pooling + flatten + linear layer for 102 classes.
-classifier_head = nn.Sequential(
-    nn.AdaptiveAvgPool2d((1, 1)),
-    nn.Flatten(),
-    nn.Linear(C, 102)  # Oxford Flowers 102 classes
-)
+    def copy_files(file_list, dest_img_dir, dest_lbl_dir):
+        for file in file_list:
+            # Copy image file
+            shutil.copy2(os.path.join(source_images_dir, file), dest_img_dir)
+            # Copy corresponding annotation file (assumes same base name with .txt)
+            base = os.path.splitext(file)[0]
+            label_file = base + ".txt"
+            src_label = os.path.join(source_labels_dir, label_file)
+            if os.path.exists(src_label):
+                shutil.copy2(src_label, dest_lbl_dir)
+            else:
+                print(f"Warning: Label file {src_label} not found.")
 
-# Combine backbone and classifier head into one model.
-class YOLOv5Classifier(nn.Module):
-    def __init__(self, backbone, classifier):
-        super(YOLOv5Classifier, self).__init__()
-        self.backbone = backbone
-        self.classifier = classifier
+    copy_files(train, images_train_dir, labels_train_dir)
+    copy_files(val, images_val_dir, labels_val_dir)
+    copy_files(test, images_test_dir, labels_test_dir)
 
-    def forward(self, x):
-        x = self.backbone(x)
-        x = self.classifier(x)
-        return x
+    print(f"Dataset organized: train({len(train)}), val({len(val)}), test({len(test)})")
+    return images_train_dir, images_val_dir  # YOLOv5 uses train and val for training
 
-model = YOLOv5Classifier(backbone, classifier_head)
-
-# -----------------------------
-# Training Setup
-# -----------------------------
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
-
-criterion = nn.CrossEntropyLoss()
-# We train only the classifier head parameters.
-optimizer = optim.Adam(model.classifier.parameters(), lr=1e-3)
 
 # -----------------------------
-# Data Preparation
+# Step 3: Create data.yaml for YOLOv5
 # -----------------------------
-# Define image transformations.
-data_transforms = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((640, 640)),  # YOLOv5 default input size
-    transforms.ToTensor(),
-    # (Optional) Normalize using ImageNet stats if desired:
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+def create_data_yaml(train_dir, val_dir, nc, names, yaml_path):
+    data = {
+        "train": os.path.abspath(train_dir),
+        "val": os.path.abspath(val_dir),
+        "nc": nc,
+        "names": names
+    }
+    os.makedirs(os.path.dirname(yaml_path), exist_ok=True)
+    with open(yaml_path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
+    print(f"data.yaml created at {os.path.abspath(yaml_path)}")
+    return yaml_path
 
-# Load labels from imagelabels.mat.
-# The .mat file usually contains a variable named 'labels'
-mat = scipy.io.loadmat('imagelabels.mat')
-labels = mat['labels'][0]  # Adjust key if necessary
-
-# Create full dataset.
-dataset = FlowersDataset('102flowers/jpg', labels, transform=data_transforms)
-
-# Split indices for training and validation (80/20 split)
-all_indices = np.arange(len(dataset))
-train_indices, val_indices = train_test_split(all_indices, test_size=0.2, random_state=42)
-
-train_dataset = Subset(dataset, train_indices)
-val_dataset = Subset(dataset, val_indices)
-
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
-val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=4)
 
 # -----------------------------
-# Training Loop
+# Main: Prepare Dataset and Run Training
 # -----------------------------
-if __name__ == '__main__':
-    num_epochs = 100
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        for images, targets in train_loader:
-            images = images.to(device)
-            targets = targets.to(device)
+if __name__ == "__main__":
+    # Define source directories (adjust if needed)
+    source_images_dir = "102flowers/jpg"  # your original images folder
+    source_labels_dir = "102flowers/labels"  # annotations will be generated here
+    base_dir = "102flowers"  # base folder for new structure
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+    # Load labels from imagelabels.mat
+    mat = scipy.io.loadmat("imagelabels.mat")
+    labels = mat["labels"][0]
 
-            running_loss += loss.item() * images.size(0)
-        epoch_loss = running_loss / len(train_dataset)
-        print(f"Epoch {epoch+1}/{num_epochs} - Training Loss: {epoch_loss:.4f}")
+    # Generate annotations in source_labels_dir (if not already generated)
+    generate_yolo_annotations(source_images_dir, source_labels_dir, labels)
 
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for images, targets in val_loader:
-                images = images.to(device)
-                targets = targets.to(device)
-                outputs = model(images)
-                _, preds = torch.max(outputs, 1)
-                total += targets.size(0)
-                correct += (preds == targets).sum().item()
-        val_accuracy = correct / total
-        print(f"Epoch {epoch+1}/{num_epochs} - Validation Accuracy: {val_accuracy:.4f}")
+    # Organize dataset into YOLOv5 structure: images/train, images/val, images/test and corresponding labels
+    images_train_dir, images_val_dir = organize_dataset(source_images_dir, source_labels_dir, base_dir)
 
-    print("Training complete.")
+    # Create data.yaml file for YOLOv5 training
+    nc = 102
+    names = [f"flower_{i}" for i in range(nc)]
+    yaml_path = os.path.join(base_dir, "data.yaml")
+    create_data_yaml(images_train_dir, images_val_dir, nc, names, yaml_path)
+
+    # -----------------------------
+    # Step 4: Define Training Parameters and Run YOLOv5 Training
+    # -----------------------------
+    command_dict = {
+        "data": yaml_path,
+        "weights": "yolov5/yolov5s.pt",  # pretrained weights from YOLOv5
+        "epochs": 30,
+        "batch": 16,
+        "imgsz": 640,
+        "freeze": [20],  # freeze first 10 layers (as a list)
+        "optimizer": "AdamW",  # use AdamW optimizer
+        "cos_lr": True,  # cosine learning rate scheduling
+        "label_smoothing": 0.1,  # label smoothing
+        "multi_scale": True,  # enable multi-scale training
+        "patience": 5,
+        "project": "training_batches",
+        "name": "train",
+        "device": "",  # auto-select GPU/CPU
+        "workers": 6,
+        "save_period": 0,
+        "cache": True
+    }
+
+    # Run YOLOv5 training
+    train.run(**command_dict)
