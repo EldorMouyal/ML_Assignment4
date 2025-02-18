@@ -5,7 +5,6 @@ import torch
 import scipy.io
 from sklearn.model_selection import train_test_split
 from yolov5 import train  # Ensure the YOLOv5 repository is in your PYTHONPATH
-
 import matplotlib.pyplot as plt
 import pandas as pd
 
