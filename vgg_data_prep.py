@@ -1,4 +1,4 @@
-# data_prep.py
+# vgg_data_prep.py
 
 import os
 import numpy as np

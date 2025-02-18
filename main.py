@@ -1,12 +1,10 @@
 import subprocess
 
 
-
-
 def main():
     # Step 1: Data Preparation
     print("Running data preparation...")
-    subprocess.run(["python", "data_prep.py"])
+    subprocess.run(["python", "vgg_data_prep.py"])
 
     # Step 2: Train VGG19
     print("Training VGG19 model...")
@@ -17,6 +15,7 @@ def main():
     subprocess.run(["python", "train_yolov5.py"])
 
     print("All processes completed.")
+
 
 if __name__ == '__main__':
     main()
